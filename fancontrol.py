@@ -1,183 +1,237 @@
-#!/root/venv/fan_control/bin/python3
+#!/usr/bin/env python3
 
-import subprocess
-import re
-import time
 import datetime
+import glob
+import re
+import shutil
+import subprocess
+import time
 
-# path to ipmitool
-ipmitool = '/usr/bin/ipmitool'
-
-# path to hddtemp
-hddtemp = '/usr/sbin/hddtemp'
-
-# list of disks to poll for temperature
-hdds = ['/dev/sda','/dev/sdb','/dev/sdc','/dev/sdd','/dev/sde','/dev/sdf','/dev/sdg','/dev/sdh']
-
-# path to log file
-logfile = '/root/venv/fan_control/logs'
+# paths to binaries
+ipmitool = shutil.which("ipmitool")
+hddtemp = shutil.which("hddtemp")
 
 # temperatures for cpu cooling override
 # script polls cpu temp once a second
-# if cpu temp goes above cpu_override_temp, all fans will be set to 100%
-# if cpu temp goes below cpu_normal_temp, cpu fan will return to 50%, hd fans will return to previous speed
-cpu_override_temp = 69
-cpu_normal_temp = 60
+# if cpu temp goes above temps["cpu"]["override"], all fans will be set to 100%
+# if cpu temp goes below temps["cpu"]["normal"], cpu fan will return to 50%, hd fans will return to previous speed
+#
+# hd target temperatures
+# if any hd temp >= temps["hdds"]["high"], fans["hdds"]["high"] will be set
+# if any hd temp == temps["hdds"]["medium_high"], fans["hdds"]["medium_high"] will be set
+# if any hd temp == temps["hdds"]["medium_low"], fans["hdds"]["medium_low"] will be set
+# if all hd temps <= temps["hdds"]["low"], fans["hdds"]["low"] will be set
+temps = {
+    "cpu": {"current": 100, "normal": 60, "override": 69},
+    "hdds": {
+        "current": 100,
+        "high": 41,
+        "medium_high": 40,
+        "medium_low": 39,
+        "low": 38,
+    },
+}
 
 # normal cpu fan speed, as a % of max
 # this value is set when the script starts and when not in cpu temperature override mode
-cpu_fan_default = 50
-
-# hd temperature polling interval in seconds
-hd_poll = 180
-
 # hd fan speeds, expressed as % of max
-hd_fans_default = 50
-hd_fans_hi = 100
-hd_fans_medhi = 75
-hd_fans_medlo = 50
-hd_fans_lo = 25
+fans = {
+    "cpu": {
+        "default": 100,
+        "high": 100,
+        "medium_high": 75,
+        "medium_low": 50,
+        "low": 25,
+        "current": 100,
+    },
+    "hdds": {
+        "default": 100,
+        "high": 100,
+        "medium_high": 75,
+        "medium_low": 50,
+        "low": 25,
+        "current": 100,
+    },
+}
 
-# hd target temperatures
-# if any hd temp >= hd_hi, hd_fans_hi will be set
-hd_hi = 41
-# if any hd temp == hd_medhi, hd_fans_medhi will be set
-hd_medhi = 40
-# if any hd temp == hd_medhi, hd_fans_medlo will be set
-hd_medlo = 39
-# if all hd temps <= hd_lo, hd_fans_lo will be set
-hd_lo = 38
+fans["cpu"]["current"] = fans["cpu"]["default"]
+fans["hdds"]["current"] = fans["hdds"]["default"]
 
-# various globals
-hdchecktime = time.time()
-currentcpufanspeed = hex(cpu_fan_default)
-currenthdfanspeed = hex(hd_fans_default)
-cpuoverride = False
-hdfanspeed = [ipmitool,'raw','0x3a','0x01',currentcpufanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed]
-allfanshigh = [ipmitool,'raw','0x3a','0x01','0x64','0x64','0x64','0x64','0x64','0x64','0x64','0x64']
-cputemp = re.compile(r'^CPU\sTemp.*\|\s([0-9][0-9])\sdegrees\sC$', re.MULTILINE)
-cpufanspeed = re.compile(r'^FAN1.*\|\s([0-9][0-9][0-9]|[0-9][0-9][0-9][0-9])\sRPM$', re.MULTILINE)
-matchhdfanspeed = re.compile(r'^FAN3.*\|\s([0-9][0-9][0-9]|[0-9][0-9][0-9][0-9])\sRPM$', re.MULTILINE)
-exhaustfanspeed = re.compile(r'^FAN5.*\|\s([0-9][0-9][0-9]|[0-9][0-9][0-9][0-9])\sRPM$', re.MULTILINE)
+hdd_polling_interval = 60  # hd temperature polling interval in seconds
+hdd_last_checked = time.time()
+
+cpu_polling_interval = 5
+cpu_override = False
+
+def get_hdds():
+  return sorted(glob.glob("/dev/sd?"))
+
+def set_fan_speeds(cpu_fan_speed: int, hdd_fan_speed: int):
+    subprocess.check_output(
+        [
+            ipmitool,
+            "raw",
+            "0x3a",
+            "0x01",
+            hex(cpu_fan_speed),
+            hex(hdd_fan_speed),
+            hex(hdd_fan_speed),
+            hex(hdd_fan_speed),
+            hex(hdd_fan_speed),
+            hex(hdd_fan_speed),
+            hex(hdd_fan_speed),
+            hex(hdd_fan_speed),
+        ]
+    )
+
+
 cpufan_max_speed = 3000
 hdfan_max_speed = 2800
 exhaustfan_max_speed = 2200
 
-def log(message):
-    with open(logfile,'a') as log:
-        log.write(str(datetime.datetime.now()))
-        log.write(' ')
-        log.write(str(message))
-        log.write('\n')
-
-def getcpufanspeed():
+def get_cpu_fan_speed():
     try:
-        time.sleep(3)
-        speed = subprocess.check_output([ipmitool,'sdr','type','Fan']).decode('utf-8')
-        speed = re.search(cpufanspeed, speed)
-        speed = speed.group(1)
-        return int(speed)
+        return int(
+            re.search(
+                re.compile(
+                    r"^FAN1.*\|\s([0-9][0-9][0-9]|[0-9][0-9][0-9][0-9])\sRPM$",
+                    re.MULTILINE,
+                ),
+                subprocess.check_output([ipmitool, "sdr", "type", "Fan"]).decode(
+                    "utf-8"
+                ),
+            ).group(1)
+        )
     except Exception as e:
-        log(e)
+        print(f"exception in get_cpu_fan_speed: {e}")
 
-def getcputemp():
-    try:
-        temp = subprocess.check_output([ipmitool,'sdr','type','Temperature']).decode('utf-8')
-        temp = re.search(cputemp, temp)
-        temp = temp.group(1)
-        return int(temp)
-    except Exception as e:
-        log(e)
-        subprocess.run(allfanshigh)
-        log('cpu temp detection failure, all fans set to 100%')
 
-def checkcputemp():
-    global currentcpufanspeed
-    global cpuoverride
+def get_cpu_temp():
     try:
-        currentcputemp = getcputemp()
-        if currentcputemp > cpu_override_temp and cpuoverride == False:
-            subprocess.run(allfanshigh)
-            cpuoverride = True
-            log('cpu temp > '+str(cpu_override_temp)+'C, all fans set to 100%')
-        elif currentcputemp < cpu_normal_temp and cpuoverride == True:
-            subprocess.run(hdfanspeed)
-            cpuoverride = False
-            log('cpu temp < '+str(cpu_normal_temp)+'C, cpu fan set to '+str(cpu_fan_default)+'%')
+        return int(
+            re.search(
+                re.compile(r"^CPU\sTemp.*\|\s([0-9][0-9])\sdegrees\sC$", re.MULTILINE),
+                subprocess.check_output(
+                    [ipmitool, "sdr", "type", "Temperature"]
+                ).decode("utf-8"),
+            ).group(1)
+        )
     except Exception as e:
-        log(e)
+        print(f"exception in get_cpu_temp: {e}")
+        set_fan_speeds(fans["cpu"]["high"], fans["hdds"]["high"])
+        print(f"cpu temp detection failure, all fans set to 100%")
 
-def gethdfanspeed():
-    try:
-        time.sleep(3)
-        speed = subprocess.check_output([ipmitool,'sdr','type','Fan']).decode('utf-8')
-        speed = re.search(matchhdfanspeed, speed)
-        speed = speed.group(1)
-        return int(speed)
-    except Exception as e:
-        log(e)
 
-def getexhaustfanspeed():
+def check_cpu_temp():
+    global fans
+    global cpu_override
     try:
-        time.sleep(3)
-        speed = subprocess.check_output([ipmitool,'sdr','type','Fan']).decode('utf-8')
-        speed = re.search(exhaustfanspeed, speed)
-        speed = speed.group(1)
-        return int(speed)
+        current_cpu_temp = get_cpu_temp()
+        if current_cpu_temp > temps["cpu"]["override"] and cpu_override == False:
+            set_fan_speeds(fans["cpu"]["high"], fans["hdds"]["high"])
+            cpu_override = True
+            print(f"cpu temp > {temps['cpu']['override']}C, all fans set to 100%")
+        elif current_cpu_temp < temps["cpu"]["normal"] and cpu_override == True:
+            set_fan_speeds(fans["cpu"]["current"], fans["hdds"]["current"])
+            cpu_override = False
+            print(
+                f"cpu temp < {temps['cpu']['normal']}C, cpu fan set to {fans['cpu']['default']}%"
+            )
     except Exception as e:
-        log(e)
+        print(f"exception in check_cpu_temp: {e}")
+
+
+def get_hdd_fan_speed():
+    try:
+        return int(
+            re.search(
+                re.compile(
+                    r"^FAN3.*\|\s([0-9][0-9][0-9]|[0-9][0-9][0-9][0-9])\sRPM$",
+                    re.MULTILINE,
+                ),
+                subprocess.check_output([ipmitool, "sdr", "type", "Fan"]).decode(
+                    "utf-8"
+                ),
+            ).group(1)
+        )
+    except Exception as e:
+        print(f"exception in get_hdd_fan_speed: {e}")
+
+
+def get_exhaust_fan_speed():
+    try:
+        return int(
+            re.search(
+                re.compile(
+                    r"^FAN5.*\|\s([0-9][0-9][0-9]|[0-9][0-9][0-9][0-9])\sRPM$",
+                    re.MULTILINE,
+                ),
+                subprocess.check_output([ipmitool, "sdr", "type", "Fan"]).decode(
+                    "utf-8"
+                ),
+            ).group(1)
+        )
+    except Exception as e:
+        print(f"exception in get_exhaust_fan_speed: {e}")
+
 
 def hdtemp(dev):
     try:
-        temp = subprocess.check_output([hddtemp,dev])
-        temp = re.match('^.*([0-9][0-9])°C$', temp.decode('utf-8'))
+        temp = subprocess.check_output([hddtemp, dev])
+        temp = re.match("^.*([0-9][0-9])°C$", temp.decode("utf-8"))
         temp = temp.group(1)
         return temp
     except Exception as e:
-        log(e)
-        subprocess.run(allfanshigh)
-        log('hd temp detection failure, all fans set to 100%')
+        print(f"exception in hdtemp: {e}")
+        set_fan_speeds(fans["cpu"]["high"], fans["hdds"]["high"])
+        print(f"hd temp detection failure, all fans set to 100%")
 
-def checkhdtemps():
+
+def check_hdd_temps(hdds):
     hdtemps = []
-    global hdchecktime
-    global currenthdfanspeed
-    global hdfanspeed
-    if cpuoverride == False:
-        try:
-            for hdd in hdds:
-                hdtemps.append(int(hdtemp(hdd)))
-            if any(x >= hd_hi for x in hdtemps):
-                currenthdfanspeed = hex(hd_fans_hi)
-                hdfanspeed = [ipmitool,'raw','0x3a','0x01',currentcpufanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed]
-                subprocess.run(hdfanspeed)
-                log('hd temp >= '+str(hd_hi)+',C fans set to '+str(hd_fans_hi)+'%')
-            elif any(x == hd_medhi for x in hdtemps):
-                currenthdfanspeed = hex(hd_fans_medhi)
-                hdfanspeed = [ipmitool,'raw','0x3a','0x01',currentcpufanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed]
-                subprocess.run(hdfanspeed)
-                log('hd temp '+str(hd_medhi)+',C fans set to '+str(hd_fans_medhi)+'%')
-            elif any(x == hd_medlo for x in hdtemps):
-                currenthdfanspeed = hex(hd_fans_medlo)
-                hdfanspeed = [ipmitool,'raw','0x3a','0x01',currentcpufanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed]
-                subprocess.run(hdfanspeed)
-                log('hd temp '+str(hd_medlo)+'C, fans set to '+str(hd_fans_medlo)+'%')
-            elif all(x <= hd_lo for x in hdtemps):
-                currenthdfanspeed = hex(hd_fans_lo)
-                hdfanspeed = [ipmitool,'raw','0x3a','0x01',currentcpufanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed,currenthdfanspeed]
-                subprocess.run(hdfanspeed)
-                log('hd temp <= '+str(hd_lo)+'C, fans set to '+str(hd_fans_lo)+'%')
-        except Exception as e:
-            log(e)
+    global hdd_last_checked
+    global fans
+
+    if not cpu_override:
+        for hdd in hdds:
+            hdtemps.append(int(hdtemp(hdd)))
+        if any(x >= temps["hdds"]["high"] for x in hdtemps):
+            fans["hdds"]["current"] = fans["hdds"]["high"]
+            set_fan_speeds(fans["cpu"]["current"], fans["hdds"]["current"])
+            print(
+                f"hd temp >= {temps['hdds']['high']}C fans set to {fans['hdds']['high']}%"
+            )
+        elif any(x == temps["hdds"]["medium_high"] for x in hdtemps):
+            fans["hdds"]["current"] = fans["hdds"]["medium_high"]
+            set_fan_speeds(fans["cpu"]["current"], fans["hdds"]["current"])
+            print(
+                f"hd temp {temps['hdds']['medium_high']}C, fans set to {fans['hdds']['medium_high']}%"
+            )
+        elif any(x == temps["hdds"]["medium_low"] for x in hdtemps):
+            fans["hdds"]["current"] = fans["hdds"]["medium_low"]
+            set_fan_speeds(fans["cpu"]["current"], fans["hdds"]["current"])
+            print(
+                f"hd temp {temps['hdds']['medium_low']}C, fans set to {fans['hdds']['medium_low']}%"
+            )
+        elif all(x <= temps["hdds"]["low"] for x in hdtemps):
+            fans["hdds"]["current"] = fans["hdds"]["low"]
+            set_fan_speeds(fans["cpu"]["current"], fans["hdds"]["current"])
+            print(
+                f"hd temp <= {temps['hdds']['low']}C, fans set to {fans['hdds']['low']}"
+            )
     else:
-        log('cpu temp override active, no action taken on hd fans')
-    hdchecktime = time.time()
+        print(f"cpu temp override active, no action taken on hd fans")
 
-checkhdtemps()
+    hdd_last_checked = time.time()
 
-while True:
-    checkcputemp()
-    currenttime = time.time()
-    if currenttime - hdchecktime >= hd_poll:
-        checkhdtemps()
-    time.sleep(1)
+
+if __name__ == "__main__":
+    print(f"ipmitool executable at {ipmitool}")
+    print(f"hddtemp executable at {hddtemp}")
+    print(f"initial hard drives: {', '.join(get_hdds())}")
+
+    while True:
+        check_cpu_temp()
+        if time.time() - hdd_last_checked >= hdd_polling_interval:
+            check_hdd_temps(get_hdds())
+        time.sleep(cpu_polling_interval)
